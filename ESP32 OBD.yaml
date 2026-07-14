@@ -1,0 +1,210 @@
+esphome:
+  name: $device_internal_name
+  friendly_name: $friendly_name
+  comment: EPS32-S3 N16R8
+  # https://github.com/shpegun60/ESP32-S3-N16R8/blob/85d3ecc973858c9ff781ffd413dd6f892be4114c/ESP32-S3-DevKitC-1-N16R8.json
+  platformio_options:
+    build_flags: 
+      -DARDUINO_USB_MODE=0
+      -DARDUINO_USB_CDC_ON_BOOT=0
+      -DCONFIG_IDF_TARGET_ESP32S3
+
+logger:
+  level: DEBUG
+  logs:
+    ble_elm327: DEBUG
+    ble_elm327.sensor: DEBUG
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+
+wifi:
+  reboot_timeout: 0s
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # ---------------------------------
+  # ESP32S3N16R8 config 20250106 serial, RGBW LEDs and working PSRAM
+
+substitutions:
+  friendly_name: "car-obd"
+  device_internal_name: car-obd
+  logger_lvl: "DEBUG"
+
+web_server:
+  version: 3
+
+esp32:
+  board: esp32-s3-devkitc1-n16r8
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
+  # partitions: "partitions_custom.csv" # partition works
+  framework:
+    type: esp-idf
+    version: recommended
+# https://community.home-assistant.io/t/ i-cant-get-the-psram-of-an-esp32-s3-n16r8-to-work/948815/8
+    sdkconfig_options:
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM: "y"
+      CONFIG_ESPTOOLPY_FLASHMODE_QIO: "y"
+      CONFIG_ESPTOOLPY_FLASHFREQ_80M: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# https://github.com/eigger/espcomponents/tree/master/components/ble_elm327
+# ------------------------------------------------
+# esp32_ble_tracker:
+#   scan_parameters:
+#     active: true
+
+# text_sensor:
+#   - platform: ble_scanner
+#     name: "BLE Devices Scanner" 
+# ------------------------------------------------
+external_components:
+  - source: github://eigger/espcomponents@latest
+    components: [ ble_elm327 ]
+    refresh: always
+
+ble_client:
+  - mac_address: "66:1E:87:00:B3:4F"
+    id: obd_client
+
+# OBD error codes - https://www.programmersought.com/article/5475147562/
+ble_elm327:
+  id: elm
+  ble_client_id: obd_client
+  # uuid values are unique to VEEPEAK OBD-II Scan Tool
+  service_uuid: "FFF0"
+  rx_char_uuid: "FFF1"
+  tx_char_uuid: "FFF2"
+  init_commands:
+    - "ATAL"
+    # - "ATSP6"
+    # - "ATS0"
+    # - "ATM0"
+    # - "ATAT1"
+  tx_delay: 50
+
+  # sleeping current of 12mA
+switch:
+  - platform: ble_client
+    ble_client_id: obd_client
+    name: "Enable OBDII"
+
+# one hex character = 4 bits
+# https://www.home-assistant.io/integrations/sensor/#device-class
+# PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
+# to calculate byte index, divide first bit position by 8, this is the byte index.
+#                       byte index                bit index         ODBdb Row #
+# 0:620101EFFBE7        a - c or x[0] - x[3]      0 - 31            0 - 3
+# 1:EF9A2040017200      x[4] - x[10]              32 - 87           4 - 10
+# 2:FFF31DBB1E1D1D      x[11]- x[17]              88 - 143          11 - 17
+# 3:1E1D1D1D0046C6      x[18]- x[24]              144 - 199
+# 4:BCC69C00007E00      x[25]- x[30]              200 - 247
+# 5:0288E6000284CD      x[31]- x[37]              248 - 303
+# 6:0001E1C30001D6      x[38]- x[40]              304 - 327
+# 7:E60375D08D0002
+# 8:F7000000000668
+sensor:
+  # new capacity is 77.4kWh
+  - platform: ble_elm327
+    name: "Remaining Energy"
+    pid: "0105"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E4"
+    update_interval: 60s
+    formula: "return (x[28] * 256.0f + x[29]) * 2.0f / 1000.0f;"
+    device_class: energy
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+
+  - platform: ble_elm327
+    name: "HV Battery State of Charge"
+    pid: "0101"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E4"
+    update_interval: 60s
+    formula: "return x[4] / 2.0f;"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+
+  - platform: ble_elm327
+    name: "HV Battery Charging"
+    pid: "0101"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E4"
+    update_interval: 60s
+    formula: "return x[9] & 0x80;"
+
+  - platform: ble_elm327
+    name: "Charger Voltage"
+    id: "charger_voltage"
+    pid: "E002"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E5"
+    update_interval: 60s
+    formula: "return (e * 256.0f + f) / 10.0f;"
+    device_class: voltage
+    unit_of_measurement: V
+    accuracy_decimals: 1
+
+  - platform: ble_elm327
+    name: "Charger Current"
+    id: "charger_current"
+    pid: "E002"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E5"
+    update_interval: 60s
+    formula: "return (x[11] * 256.0f + x[12]) / 100.0f;"
+    device_class: current
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    on_value:
+      then:
+      - component.update: charger_power
+
+  - platform: template
+    name: "Charger Power"
+    id: "charger_power"
+    lambda: |-
+      return ( id(charger_voltage).state * id(charger_current).state ) / 1000.0f;
+    device_class: power
+    unit_of_measurement: kW
+    accuracy_decimals: 1
+
+  - platform: ble_elm327
+    name: "12V Battery State of Charge"
+    pid: "E011"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E5"
+    update_interval: 60s
+    formula: "return x[20];"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+  - platform: ble_elm327
+    name: "12V Battery Voltage"
+    pid: "E001"
+    mode: "22"
+    pre_commands:
+      - "ATSH 744"
+    update_interval: 60s
+    formula: "return (x[11] * 256.0f + x[12]) / 100.0f;"
+    device_class: voltage
+    unit_of_measurement: V
+    accuracy_decimals: 1
