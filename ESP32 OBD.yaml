@@ -4,6 +4,8 @@ esphome:
   comment: EPS32-S3 N16R8
   # https://github.com/shpegun60/ESP32-S3-N16R8/blob/85d3ecc973858c9ff781ffd413dd6f892be4114c/ESP32-S3-DevKitC-1-N16R8.json
   platformio_options:
+  #   board_build.arduino.memory_type: qio_opi
+  #   board_build.flash_mode: qio
     build_flags: 
       -DARDUINO_USB_MODE=0
       -DARDUINO_USB_CDC_ON_BOOT=0
@@ -76,6 +78,7 @@ ble_client:
   - mac_address: "66:1E:87:00:B3:4F"
     id: obd_client
 
+# http://forum.gps-laptimer.de/viewtopic.php?p=25972#p25972
 # OBD error codes - https://www.programmersought.com/article/5475147562/
 ble_elm327:
   id: elm
@@ -102,18 +105,66 @@ switch:
 # https://www.home-assistant.io/integrations/sensor/#device-class
 # PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
 # to calculate byte index, divide first bit position by 8, this is the byte index.
-#                       byte index                bit index         ODBdb Row #
-# 0:620101EFFBE7        a - c or x[0] - x[3]      0 - 31            0 - 3
-# 1:EF9A2040017200      x[4] - x[10]              32 - 87           4 - 10
-# 2:FFF31DBB1E1D1D      x[11]- x[17]              88 - 143          11 - 17
-# 3:1E1D1D1D0046C6      x[18]- x[24]              144 - 199
-# 4:BCC69C00007E00      x[25]- x[30]              200 - 247
-# 5:0288E6000284CD      x[31]- x[37]              248 - 303
-# 6:0001E1C30001D6      x[38]- x[40]              304 - 327
-# 7:E60375D08D0002
-# 8:F7000000000668
+
+#            0  1  2
+# 0:62 01 01 EF FB E7
+
+#   3  4  5  6  7  8  9
+# 1:EF 9A 20 40 01 72 00
+
+#   10 11 12 13 14 15 16
+# 2:FF F3 1D BB 1E 1D 1D
+
+#   17 18 19 20 21 22 23
+# 3:1E 1D 1D 1D 00 46 C6
+
+#   24 25 26 27 28 29 30
+# 4:BC C6 9C 00 00 7E 00
+
+#   31 32 33 34 35 36 37
+# 5:02 88 E6 00 02 84 CD
+
+# 6:00 01 E1 C3 00 01 D6
+# 7:E6 03 75 D0 8D 00 02
+# 8:F7 00 00 00 00 06 68
 sensor:
-  # new capacity is 77.4kWh
+  # 0:62B002D00000
+  # 1:00FF9B00000000
+  # 2:7A95AAAAAAAAAA #7A95 is mileage
+  - platform: ble_elm327
+    name: "Odometer"
+    pid: "B002"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7C6"
+    update_interval: 60s
+    formula: "return (x[9] * 0x10000 + x[10] * 0x100 + x[11]);"
+    device_class: distance
+    unit_of_measurement: mi
+    accuracy_decimals: 0
+
+    # when charging [9] = 0111 0010
+  - platform: ble_elm327
+    name: "HV Battery Charging"
+    pid: "0101"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E4"
+    update_interval: 60s
+    formula: "return x[8] == 0x72;" # BIT POSITION 72
+
+  - platform: ble_elm327
+    name: "Charging Socket Connected"
+    pid: "E004"
+    mode: "22"
+    pre_commands:
+      - "ATSH 744"
+    update_interval: 60s
+    formula: "return x[4];" # BIT POSITION 38
+    
+    # new capacity is 77.4kWh
+    # this may be calculated from 70kWh
+    # https://www.reddit.com/r/Ioniq5/comments/1uy5k56/comment/oxwil5x/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
   - platform: ble_elm327
     name: "Remaining Energy"
     pid: "0105"
@@ -125,27 +176,24 @@ sensor:
     device_class: energy
     unit_of_measurement: kWh
     accuracy_decimals: 2
-
+    filters:
+      - clamp:
+          max_value: 77.4
+          ignore_out_of_range: true
+      
   - platform: ble_elm327
     name: "HV Battery State of Charge"
-    pid: "0101"
+    # pid: "0101" # internal?
+    pid: "0105"
     mode: "22"
     pre_commands:
       - "ATSH 7E4"
     update_interval: 60s
-    formula: "return x[4] / 2.0f;"
+    # formula: "return x[4] / 2.0f;"
+    formula: "return x[31] / 2.0f;"
     device_class: battery
     unit_of_measurement: "%"
     accuracy_decimals: 1
-
-  - platform: ble_elm327
-    name: "HV Battery Charging"
-    pid: "0101"
-    mode: "22"
-    pre_commands:
-      - "ATSH 7E4"
-    update_interval: 60s
-    formula: "return x[9] & 0x80;"
 
   - platform: ble_elm327
     name: "Charger Voltage"
@@ -208,3 +256,7 @@ sensor:
     device_class: voltage
     unit_of_measurement: V
     accuracy_decimals: 1
+    filters:
+      - clamp:
+          max_value: 20.0
+          ignore_out_of_range: true
