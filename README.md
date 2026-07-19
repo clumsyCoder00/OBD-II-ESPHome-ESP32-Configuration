@@ -1,4 +1,4 @@
- I've been wanting to pull data from my car parked in the garage for some time, and after recently purchasing another car, I found the motivation to put some effort into the process. I've found some projects using the Torque app, but I wanted a solution that allowed for direct communication from the OBD Bluetooth module through an ESP32 to homeassistant.
+ I've been wanting to pull data from my car parked in the garage for some time, and after recently purchasing another car, I found the motivation to put some effort into the process. I've found some projects using the Torque app, but I wanted a solution that allowed for direct communication from the OBD Bluetooth module through an ESP32 to homeassistant. This example is based around a 2023 Hyundai IONIQ 5 SEL. All of the PID values and data parsing are unique to this vehicle. They are included as an example of how data is to be collected and parsed.
 
 My repo for my complete config yaml is over here:
 
