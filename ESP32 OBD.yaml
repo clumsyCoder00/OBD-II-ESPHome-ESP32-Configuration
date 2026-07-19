@@ -106,8 +106,8 @@ switch:
 # PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
 # to calculate byte index, divide first bit position by 8, this is the byte index.
 
-#            0  1  2
-# 0:62 01 01 EF FB E7
+#            0  1  2         (first row is byte index)
+# 0:62 01 01 EF FB E7        (second row is the data)
 
 #   3  4  5  6  7  8  9
 # 1:EF 9A 20 40 01 72 00
