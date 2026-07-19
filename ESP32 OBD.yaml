@@ -127,6 +127,20 @@ switch:
 # 6:00 01 E1 C3 00 01 D6
 # 7:E6 03 75 D0 8D 00 02
 # 8:F7 00 00 00 00 06 68
+# https://www.home-assistant.io/integrations/binary_sensor/#device-class
+binary_sensor:
+  - platform: template
+    name: "HV Battery"
+    lambda: |-
+      return id(hv_battery_charging).state > 0.0f;
+    device_class: battery_charging
+
+  - platform: template
+    name: "Charging Socket"
+    lambda: |-
+      return id(charging_socket_connected).state > 0.0f;
+    device_class: connectivity
+      
 sensor:
   # 0:62B002D00000
   # 1:00FF9B00000000
@@ -145,22 +159,27 @@ sensor:
 
     # when charging [9] = 0111 0010
   - platform: ble_elm327
-    name: "HV Battery Charging"
+    # name: "HV Battery Charging - raw"
+    id: hv_battery_charging
     pid: "0101"
     mode: "22"
     pre_commands:
       - "ATSH 7E4"
     update_interval: 60s
-    formula: "return x[8] == 0x72;" # BIT POSITION 72
+    formula: "return x[8];" # BIT POSITION 72
 
+    # 5 - connected (stays at 5 when not charging)    0101
+    # 4 - not connected or charging                   0100
+    # 0 - not connected, not charging                 0000
   - platform: ble_elm327
-    name: "Charging Socket Connected"
+    # name: "Charging Socket Connected - raw"
+    id: charging_socket_connected
     pid: "E004"
     mode: "22"
     pre_commands:
       - "ATSH 744"
     update_interval: 60s
-    formula: "return x[4];" # BIT POSITION 38
+    formula: "return x[4] & 0x01;" # BIT POSITION 38, 2's place
     
     # new capacity is 77.4kWh
     # this may be calculated from 70kWh
@@ -183,7 +202,6 @@ sensor:
       
   - platform: ble_elm327
     name: "HV Battery State of Charge"
-    # pid: "0101" # internal?
     pid: "0105"
     mode: "22"
     pre_commands:
@@ -194,6 +212,10 @@ sensor:
     device_class: battery
     unit_of_measurement: "%"
     accuracy_decimals: 1
+    filters:
+      - clamp:
+          min_value: 1.0
+          ignore_out_of_range: true
 
   - platform: ble_elm327
     name: "Charger Voltage"
@@ -220,6 +242,10 @@ sensor:
     device_class: current
     unit_of_measurement: A
     accuracy_decimals: 2
+    filters:
+      - clamp:
+          max_value: 48
+          ignore_out_of_range: true
     on_value:
       then:
       - component.update: charger_power
@@ -244,6 +270,10 @@ sensor:
     device_class: battery
     unit_of_measurement: "%"
     accuracy_decimals: 0
+    filters:
+      - clamp:
+          min_value: 1.0
+          ignore_out_of_range: true
 
   - platform: ble_elm327
     name: "12V Battery Voltage"
