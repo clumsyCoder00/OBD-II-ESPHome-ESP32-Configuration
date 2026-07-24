@@ -59,6 +59,15 @@ psram:
   mode: octal
   speed: 80MHz
 
+time:
+  - platform: sntp
+    id: my_time
+    timezone: EST+5EDT,M3.2.0/2,M11.1.0/2
+    on_time:
+      - seconds: 0
+        minutes: '*'
+        then:
+        - script.execute: set_target
 # https://github.com/eigger/espcomponents/tree/master/components/ble_elm327
 # ------------------------------------------------
 # esp32_ble_tracker:
@@ -77,7 +86,20 @@ external_components:
 ble_client:
   - mac_address: "66:1E:87:00:B3:4F"
     id: obd_client
-
+    on_connect:
+      then:
+        # - lambda: |-
+        #     ESP_LOGD("ble_client_lambda", "Connected to BLE device");
+        - binary_sensor.template.publish:
+            id: car_present
+            state: ON
+    on_disconnect:
+      then:
+        # - lambda: |-
+        #     ESP_LOGD("ble_client_lambda", "Connected to BLE device");
+        - binary_sensor.template.publish:
+            id: car_present
+            state: OFF
 # http://forum.gps-laptimer.de/viewtopic.php?p=25972#p25972
 # OBD error codes - https://www.programmersought.com/article/5475147562/
 ble_elm327:
@@ -106,8 +128,8 @@ switch:
 # PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
 # to calculate byte index, divide first bit position by 8, this is the byte index.
 
-#            0  1  2         (first row is byte index)
-# 0:62 01 01 EF FB E7        (second row is the data)
+#            0  1  2
+# 0:62 01 01 EF FB E7
 
 #   3  4  5  6  7  8  9
 # 1:EF 9A 20 40 01 72 00
@@ -128,19 +150,92 @@ switch:
 # 7:E6 03 75 D0 8D 00 02
 # 8:F7 00 00 00 00 06 68
 # https://www.home-assistant.io/integrations/binary_sensor/#device-class
+number:
+  - platform: template
+    name: "Target Charge"
+    id: target_charge
+    # web_server:
+    #   sorting_group_id: sorting_group_control_settings
+    #   sorting_weight: 40
+    optimistic: true
+    restore_value: True
+    # device_class: battery_charging
+    unit_of_measurement: "%"
+    min_value: 20
+    initial_value: 80
+    max_value: 100
+    step: 1.0
+    on_value:
+      - script.execute: set_target
+
+datetime:
+  - platform: template
+    id: datetime_target
+    type: time
+    name: Time to Target
+    optimistic: yes
+
 binary_sensor:
   - platform: template
     name: "HV Battery"
+    id: hv_battery
     lambda: |-
       return id(hv_battery_charging).state > 0.0f;
     device_class: battery_charging
+    on_state:
+      then:
+      - component.update: charger_current
+      - component.update: charger_voltage
 
   - platform: template
     name: "Charging Socket"
     lambda: |-
-      return id(charging_socket_connected).state > 0.0f;
+      return id(charging_socket_connected).state == 1.0f || id(charging_socket_connected).state == 5.0f || id(charging_socket_connected).state == 2.0f || id(charging_socket_connected).state == 36.0f;
     device_class: connectivity
-      
+
+  - platform: template
+    name: "Car Present"
+    id: car_present
+    # lambda: |-
+    #   return id(hv_battery_charging).state > 0.0f;
+    device_class: presence
+
+    # 57.66kWh = 80%
+script:
+  - id: set_target
+    mode: queued
+    then:
+      - datetime.time.set:
+          id: datetime_target
+          time: !lambda |-
+            float remaining_energy_int, target_charge_int, energy_diff, charge_power, target_energy, target_time, total_time;
+            // get current charge
+            remaining_energy_int = id(remaining_energy).state;
+            // temp
+            //remaining_energy_int = 56.53f;
+            // get target charge
+            target_charge_int = id(target_charge).state;
+            target_energy = ( target_charge_int / 100.0f ) * 72.075f; // full capacty is 77.4kWh
+            // get difference
+            energy_diff = target_energy - remaining_energy_int;
+            // ESP_LOGI("main", "energy_diff: %02f", energy_diff);
+            
+            charge_power = id(charger_power).state;
+            // temp
+            //charge_power = 1.4f;
+            
+            target_time = max(energy_diff / charge_power, 0.0f);
+            // ESP_LOGI("main", "target_time: %02f", target_time);
+
+            total_time = target_time + id(my_time).now().hour + (id(my_time).now().minute / 60.0f);
+            
+            int this_minute, this_hour;
+            this_minute = (int)(((int)(total_time * 60)) % 60);
+            
+            this_hour = ((int)total_time) % 24;            
+
+            return {.minute = (uint8_t) this_minute, .hour = (uint8_t) this_hour};
+        
 sensor:
   # 0:62B002D00000
   # 1:00FF9B00000000
@@ -172,20 +267,21 @@ sensor:
     # 4 - not connected or charging                   0100
     # 0 - not connected, not charging                 0000
   - platform: ble_elm327
-    # name: "Charging Socket Connected - raw"
+    name: "Charging Socket Connected - raw"
     id: charging_socket_connected
     pid: "E004"
     mode: "22"
     pre_commands:
       - "ATSH 744"
     update_interval: 60s
-    formula: "return x[4] & 0x01;" # BIT POSITION 38, 2's place
+    formula: "return x[4];" # & 0x01;" # BIT POSITION 38, 1's place
     
     # new capacity is 77.4kWh
     # this may be calculated from 70kWh
     # https://www.reddit.com/r/Ioniq5/comments/1uy5k56/comment/oxwil5x/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
   - platform: ble_elm327
     name: "Remaining Energy"
+    id: remaining_energy
     pid: "0105"
     mode: "22"
     pre_commands:
@@ -199,6 +295,8 @@ sensor:
       - clamp:
           max_value: 77.4
           ignore_out_of_range: true
+    on_value:
+      - script.execute: set_target
       
   - platform: ble_elm327
     name: "HV Battery State of Charge"
@@ -218,21 +316,24 @@ sensor:
           ignore_out_of_range: true
 
   - platform: ble_elm327
-    name: "Charger Voltage"
-    id: "charger_voltage"
+    # name: "Charger Voltage - raw"
+    id: "charger_voltage_raw"
     pid: "E002"
     mode: "22"
-    pre_commands:
+    pre_commands: 
       - "ATSH 7E5"
     update_interval: 60s
     formula: "return (e * 256.0f + f) / 10.0f;"
     device_class: voltage
     unit_of_measurement: V
     accuracy_decimals: 1
+    on_value:
+      then:
+      - component.update: charger_voltage
 
   - platform: ble_elm327
-    name: "Charger Current"
-    id: "charger_current"
+    # name: "Charger Current - raw"
+    id: "charger_current_raw"
     pid: "E002"
     mode: "22"
     pre_commands:
@@ -248,16 +349,46 @@ sensor:
           ignore_out_of_range: true
     on_value:
       then:
+      - component.update: charger_current
+
+  - platform: template
+    name: "Charger Voltage"
+    id: "charger_voltage"
+    lambda: |-
+      if( id(hv_battery) )
+        return id(charger_voltage_raw).state;
+      else
+        return 0.0f;
+    device_class: voltage
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    on_value:
       - component.update: charger_power
 
   - platform: template
+    name: "Charger Current"
+    id: "charger_current"
+    lambda: |-
+      if( id(hv_battery) )
+        return id(charger_current_raw).state;
+      else
+        return 0.0f;
+    device_class: current
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    on_value:
+      - component.update: charger_power
+    
+  - platform: template
     name: "Charger Power"
-    id: "charger_power"
+    id: charger_power
     lambda: |-
       return ( id(charger_voltage).state * id(charger_current).state ) / 1000.0f;
     device_class: power
     unit_of_measurement: kW
     accuracy_decimals: 1
+    on_value:
+      - script.execute: set_target
 
   - platform: ble_elm327
     name: "12V Battery State of Charge"
@@ -286,6 +417,22 @@ sensor:
     device_class: voltage
     unit_of_measurement: V
     accuracy_decimals: 1
+    filters:
+      - clamp:
+          max_value: 20.0
+          ignore_out_of_range: true
+
+  - platform: ble_elm327
+    name: "12V Battery Current"
+    pid: "E011"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E5"
+    update_interval: 60s
+    formula: "return ((x[18] * 256.0f + x[19]) / 100.0f ) - 327.0f;" # + -327 
+    device_class: current
+    unit_of_measurement: A
+    accuracy_decimals: 2
     filters:
       - clamp:
           max_value: 20.0
