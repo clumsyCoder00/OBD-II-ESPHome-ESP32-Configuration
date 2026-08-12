@@ -1,3 +1,4 @@
+# 8.12.26 - added cushin factor for chgarger losses, offset reported battery state to charge 1% over actual charge to get complete charge at 100%
 esphome:
   name: $device_internal_name
   friendly_name: $friendly_name
@@ -37,7 +38,6 @@ substitutions:
   logger_lvl: "DEBUG"
 
 web_server:
-  version: 3
 
 esp32:
   board: esp32-s3-devkitc1-n16r8
@@ -59,15 +59,6 @@ psram:
   mode: octal
   speed: 80MHz
 
-time:
-  - platform: sntp
-    id: my_time
-    timezone: EST+5EDT,M3.2.0/2,M11.1.0/2
-    on_time:
-      - seconds: 0
-        minutes: '*'
-        then:
-        - script.execute: set_target
 # https://github.com/eigger/espcomponents/tree/master/components/ble_elm327
 # ------------------------------------------------
 # esp32_ble_tracker:
@@ -77,7 +68,9 @@ time:
 # text_sensor:
 #   - platform: ble_scanner
 #     name: "BLE Devices Scanner" 
-# ------------------------------------------------
+# https://esphome.io/components/http_request.html
+http_request:
+
 external_components:
   - source: github://eigger/espcomponents@latest
     components: [ ble_elm327 ]
@@ -100,8 +93,9 @@ ble_client:
         - binary_sensor.template.publish:
             id: car_present
             state: OFF
+
 # http://forum.gps-laptimer.de/viewtopic.php?p=25972#p25972
-# OBD error codes - https://www.programmersought.com/article/5475147562/
+# error codes - https://www.programmersought.com/article/5475147562/
 ble_elm327:
   id: elm
   ble_client_id: obd_client
@@ -117,12 +111,10 @@ ble_elm327:
     # - "ATAT1"
   tx_delay: 50
 
-  # sleeping current of 12mA
 switch:
   - platform: ble_client
     ble_client_id: obd_client
     name: "Enable OBDII"
-
 # one hex character = 4 bits
 # https://www.home-assistant.io/integrations/sensor/#device-class
 # PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
@@ -154,26 +146,27 @@ number:
   - platform: template
     name: "Target Charge"
     id: target_charge
-    # web_server:
-    #   sorting_group_id: sorting_group_control_settings
-    #   sorting_weight: 40
     optimistic: true
-    restore_value: True
-    # device_class: battery_charging
+    restore_value: true
     unit_of_measurement: "%"
     min_value: 20
     initial_value: 80
     max_value: 100
     step: 1.0
     on_value:
-      - script.execute: set_target
+      - script.execute: ev_set_charge_limit
+      - script.execute: set_charge_current
 
 datetime:
   - platform: template
-    id: datetime_target
+    id: datetime_ready
     type: time
-    name: Time to Target
+    name: Ready Time
+    restore_value: true
     optimistic: yes
+    on_value:
+      then:
+      - script.execute: set_charge_current
 
 binary_sensor:
   - platform: template
@@ -196,47 +189,168 @@ binary_sensor:
   - platform: template
     name: "Car Present"
     id: car_present
-    # lambda: |-
-    #   return id(hv_battery_charging).state > 0.0f;
     device_class: presence
 
-    # 57.66kWh = 80%
+# 42.46kwh	57.63	15.17
+# 60%		80%	20%
+# 10:20		1:28	15:08
+# 			1.0kW		1.32kW	71.6%
+
+# 21.68		57.66	35.98
+# 10:38		4:12	5:34
+# 			6.46kW		7.5kW	86.1%
+
+# 9:53      6:43    8:50
+# 31.21     65.54   34.33
+#           4.25kW  3.886kW  91.4%
+
+# 10:22     6:42    8:20
+# 22.48     57.60   35.12
+#           4.73kW  4.21kW   89.0%
+
+# 8:41      12:36   15.92
+# 14.36     52.47   38.11
+#                   2.39 kW
+#                   2.8 kw   85.4%
+
+# estimate at beginning was 14 hours
+# actual time was 11.5 hours
+# 21.5% faster than estimate
+# even though reported levels are showing 85% efficiency, charge time estimate is consistently longer than actual
+# 11:13     10:43    11.5
+# 11.69     57.66   45.97
+#                   4.00kW  4.7kW   85.0%
+time:
+  - platform: sntp
+    id: my_time
+    timezone: EST+5EDT,M3.2.0/2,M11.1.0/2
+    on_time:
+      - seconds: 0
+        minutes: '*'
+        then:
+        - script.execute: set_charge_current
+          
 script:
-  - id: set_target
-    mode: queued
+  - id: set_charge_current
     then:
-      - datetime.time.set:
-          id: datetime_target
-          time: !lambda |-
-            float remaining_energy_int, target_charge_int, energy_diff, charge_power, target_energy, target_time, total_time;
-            // get current charge
-            remaining_energy_int = id(remaining_energy).state;
-            // temp
-            //remaining_energy_int = 56.53f;
-            // get target charge
-            target_charge_int = id(target_charge).state;
-            target_energy = ( target_charge_int / 100.0f ) * 72.075f; // full capacty is 77.4kWh
-            // get difference
-            energy_diff = target_energy - remaining_energy_int;
-            // ESP_LOGI("main", "energy_diff: %02f", energy_diff);
-            
-            charge_power = id(charger_power).state;
-            // temp
-            //charge_power = 1.4f;
-            
-            target_time = max(energy_diff / charge_power, 0.0f);
-            // ESP_LOGI("main", "target_time: %02f", target_time);
+      - sensor.template.publish:
+          id: target_charge_current
+          state: !lambda |-
+              float full_capacity_energy, remaining_energy_float, target_charge_float, current_charge_float, time_now_float, time_ready_float, time_to_ready_float, needed_energy_float, charger_voltage_float;
+              full_capacity_energy = 73.7f;
+              
+              target_charge_float = id(target_charge).state;
+              current_charge_float = id(hv_SOC).state;
+              
+              remaining_energy_float = id(remaining_energy).state;
 
-            total_time = target_time + id(my_time).now().hour + (id(my_time).now().minute / 60.0f);
-            
-            int this_minute, this_hour;
-            this_minute = (int)(((int)(total_time * 60)) % 60);
-            
-            this_hour = ((int)total_time) % 24;            
+              needed_energy_float = (full_capacity_energy * ( target_charge_float / 100.0f )) - remaining_energy_float;
+              // ESP_LOGI("main", "needed_energy_float: %02f", needed_energy_float);
+              // in hours
+              time_now_float = id(my_time).now().hour + (id(my_time).now().minute / 60.0f);
+              time_ready_float = id(datetime_ready).hour + (id(datetime_ready).minute / 60.0f);
+              
+              // if ready time is today
+              if( time_ready_float > time_now_float ){
+                time_to_ready_float = time_ready_float - time_now_float;
+              }
+              else { // it's tomorrow 13:00 , ready time is 8:00, 8 + (24-13) = 
+                time_to_ready_float = time_ready_float + (24 - time_now_float);
+              }
+              // ESP_LOGI("main", "time_to_ready_float: %02f", time_to_ready_float);
 
-            return {.minute = (uint8_t) this_minute, .hour = (uint8_t) this_hour};
-        
+              // energy = volts * amps * hours
+              // energy / volts * hours = amps
+              if ( id(charger_voltage).state < 200.0f || isnan(id(charger_voltage).state) )
+                charger_voltage_float = 240.0f;
+              else
+                charger_voltage_float = id(charger_voltage).state * 1.0f;
+                
+              // ESP_LOGI("main", "charger_voltage_float: %02f", charger_voltage_float);
+
+              // ESP_LOGI("main", "target_charge_current: %02f", needed_energy_float / ( charger_voltage_float * time_to_ready_float));
+              // 0.95 for charger losses causing current spike at end of charge
+              if( current_charge_float < target_charge_float )
+                return 1000.0f * (needed_energy_float / (charger_voltage_float * time_to_ready_float * 0.95)) + 0.5f; // 0.5 to account for difference between pilot and actual current.
+              else
+                return 0.0f;
+      - script.execute: ev_set_state
+      - script.execute: ev_set_charge_current
+
+  - id: ev_send_batt
+    then:
+    - http_request.post:
+        url: http://10.0.1.81/status
+        json:
+          battery_level: !lambda |-
+            // charge 1% past target
+            int N = id(hv_SOC).state - 1;
+            char str[12];
+            return itoa(N, str, 10) ;
+          
+# url: http://10.0.1.81/limit
+  # type: 'soc'
+  # auto_release: 'true'
+  - id: ev_set_charge_limit
+    then:
+    - http_request.post:
+        url: http://10.0.1.81/config
+        json:
+          limit_default_value: !lambda |-
+            int N = id(target_charge).state;
+            char str[12];
+            return itoa(N, str, 10) ;
+          limit_default_type: 'soc'
+
+  - id: ev_set_state
+    then:
+      - if:
+          condition: 
+            lambda: |-
+              float target_charge_current_float = id(target_charge_current).state;
+              int target_charge_current_int = ceil(target_charge_current_float);
+              int safe_current_int;
+              return target_charge_current_int < 6;
+
+          then:
+            - http_request.post:
+                url: http://10.0.1.81/override
+                json:
+                  state: 'disabled'
+          else:
+            - http_request.send:
+                method: DELETE
+                url: http://10.0.1.81/override
+
+  - id: ev_set_charge_current
+    then:
+    - http_request.post:
+        url: http://10.0.1.81/config
+        json:
+          max_current_soft: !lambda |-
+            float target_charge_current_float = id(target_charge_current).state;
+            int target_charge_current_int = ceil(target_charge_current_float);
+            int safe_current_int;
+            
+            if( target_charge_current_int < 6)
+              safe_current_int = 6;
+            else if( target_charge_current_int > 32 )
+              safe_current_int = 32;
+            else
+              safe_current_int = target_charge_current_int;
+            
+            char str[12];
+            return itoa(safe_current_int, str, 10);
+    
 sensor:
+  - platform: template
+    name: "Target Charge Current"
+    id: target_charge_current
+    device_class: current
+    unit_of_measurement: A
+    filters:
+    - round: 1
+
   # 0:62B002D00000
   # 1:00FF9B00000000
   # 2:7A95AAAAAAAAAA #7A95 is mileage
@@ -254,7 +368,6 @@ sensor:
 
     # when charging [9] = 0111 0010
   - platform: ble_elm327
-    # name: "HV Battery Charging - raw"
     id: hv_battery_charging
     pid: "0101"
     mode: "22"
@@ -267,17 +380,16 @@ sensor:
     # 4 - not connected or charging                   0100
     # 0 - not connected, not charging                 0000
   - platform: ble_elm327
-    name: "Charging Socket Connected - raw"
+    # name: "Charging Socket Connected - raw"
     id: charging_socket_connected
     pid: "E004"
     mode: "22"
     pre_commands:
       - "ATSH 744"
     update_interval: 60s
-    formula: "return x[4];" # & 0x01;" # BIT POSITION 38, 1's place
+    formula: "return x[4];"
     
     # new capacity is 77.4kWh
-    # this may be calculated from 70kWh
     # https://www.reddit.com/r/Ioniq5/comments/1uy5k56/comment/oxwil5x/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
   - platform: ble_elm327
     name: "Remaining Energy"
@@ -294,18 +406,19 @@ sensor:
     filters:
       - clamp:
           max_value: 77.4
+          min_value: 2.0
           ignore_out_of_range: true
     on_value:
-      - script.execute: set_target
+      - script.execute: set_charge_current
       
   - platform: ble_elm327
     name: "HV Battery State of Charge"
+    id: hv_SOC
     pid: "0105"
     mode: "22"
     pre_commands:
       - "ATSH 7E4"
     update_interval: 60s
-    # formula: "return x[4] / 2.0f;"
     formula: "return x[31] / 2.0f;"
     device_class: battery
     unit_of_measurement: "%"
@@ -314,9 +427,45 @@ sensor:
       - clamp:
           min_value: 1.0
           ignore_out_of_range: true
+    on_value:
+      - script.execute: ev_send_batt
 
   - platform: ble_elm327
-    # name: "Charger Voltage - raw"
+    name: "dashboard - HV SOC"
+    pid: "0101"
+    mode: "22"
+    pre_commands:
+      - "ATSH 7E4"
+    update_interval: 60s
+    formula: "return x[4] / 2.0f;"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    filters:
+      - clamp:
+          min_value: 1.0
+          max_value: 105.0
+          ignore_out_of_range: true
+      
+  - platform: ble_elm327
+    name: "VCMS - HV SOC"
+    pid: "E003"
+    mode: "22"
+    pre_commands:
+      - "ATSH 744"
+    update_interval: 60s
+    formula: "return x[15] / 2.0f;"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    filters:
+      - clamp:
+          min_value: 1.0
+          max_value: 105.0
+          ignore_out_of_range: true
+
+
+  - platform: ble_elm327
     id: "charger_voltage_raw"
     pid: "E002"
     mode: "22"
@@ -332,7 +481,6 @@ sensor:
       - component.update: charger_voltage
 
   - platform: ble_elm327
-    # name: "Charger Current - raw"
     id: "charger_current_raw"
     pid: "E002"
     mode: "22"
@@ -365,7 +513,7 @@ sensor:
     on_value:
       - component.update: charger_power
 
-  - platform: template
+- platform: template
     name: "Charger Current"
     id: "charger_current"
     lambda: |-
@@ -386,9 +534,7 @@ sensor:
       return ( id(charger_voltage).state * id(charger_current).state ) / 1000.0f;
     device_class: power
     unit_of_measurement: kW
-    accuracy_decimals: 1
-    on_value:
-      - script.execute: set_target
+    accuracy_decimals: 2
 
   - platform: ble_elm327
     name: "12V Battery State of Charge"
@@ -403,7 +549,8 @@ sensor:
     accuracy_decimals: 0
     filters:
       - clamp:
-          min_value: 1.0
+          min_value: 2.0
+          max_value: 110
           ignore_out_of_range: true
 
   - platform: ble_elm327
