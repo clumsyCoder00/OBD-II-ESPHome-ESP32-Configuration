@@ -1,16 +1,20 @@
+# TODO
+# - calculator to measure charging efficiency
+# - when charge starts, store battery energy.
+# when either energy value updates, calculate current charge efficiency. (current battery charge - start battery charge) / charger energy
 # 8.12.26 - added cushin factor for chgarger losses, offset reported battery state to charge 1% over actual charge to get complete charge at 100%
 esphome:
   name: $device_internal_name
   friendly_name: $friendly_name
   comment: EPS32-S3 N16R8
   # https://github.com/shpegun60/ESP32-S3-N16R8/blob/85d3ecc973858c9ff781ffd413dd6f892be4114c/ESP32-S3-DevKitC-1-N16R8.json
-  platformio_options:
+  # platformio_options:
   #   board_build.arduino.memory_type: qio_opi
   #   board_build.flash_mode: qio
-    build_flags: 
-      -DARDUINO_USB_MODE=0
-      -DARDUINO_USB_CDC_ON_BOOT=0
-      -DCONFIG_IDF_TARGET_ESP32S3
+  build_flags: 
+    -DARDUINO_USB_MODE=0
+    -DARDUINO_USB_CDC_ON_BOOT=0
+    -DCONFIG_IDF_TARGET_ESP32S3
 
 logger:
   level: DEBUG
@@ -27,8 +31,9 @@ ota:
 
 wifi:
   reboot_timeout: 0s
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
   # ---------------------------------
   # ESP32S3N16R8 config 20250106 serial, RGBW LEDs and working PSRAM
 
@@ -37,7 +42,7 @@ substitutions:
   device_internal_name: car-obd
   logger_lvl: "DEBUG"
 
-web_server:
+# web_server:
 
 esp32:
   board: esp32-s3-devkitc1-n16r8
@@ -54,6 +59,7 @@ esp32:
       CONFIG_SPIRAM: "y"
       CONFIG_ESPTOOLPY_FLASHMODE_QIO: "y"
       CONFIG_ESPTOOLPY_FLASHFREQ_80M: "y"
+
 
 psram:
   mode: octal
@@ -79,6 +85,7 @@ external_components:
 ble_client:
   - mac_address: "66:1E:87:00:B3:4F"
     id: obd_client
+    # auto_connect: false
     on_connect:
       then:
         # - lambda: |-
@@ -111,10 +118,22 @@ ble_elm327:
     # - "ATAT1"
   tx_delay: 50
 
+globals:
+  - id: start_energy
+    type: float
+    initial_value: '0.0'
+    
 switch:
   - platform: ble_client
     ble_client_id: obd_client
     name: "Enable OBDII"
+        
+  - platform: template
+    name: "Enable EVSE API"
+    id: evse_api
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
 # one hex character = 4 bits
 # https://www.home-assistant.io/integrations/sensor/#device-class
 # PID codes - https://obdb.community/#/vehicles/Hyundai/IONIQ-5
@@ -143,21 +162,50 @@ switch:
 # 8:F7 00 00 00 00 06 68
 # https://www.home-assistant.io/integrations/binary_sensor/#device-class
 number:
+  # - platform: template
+  #   name: "Efficiency"
+  #   id: efficiency
+  #   # web_server:
+  #   #   sorting_group_id: sorting_group_control_settings
+  #   #   sorting_weight: 40
+  #   optimistic: true
+  #   restore_value: True
+  #   # device_class: battery_charging
+  #   unit_of_measurement: "mi/kWh"
+  #   min_value: 3.0
+  #   initial_value: 3.1
+  #   max_value: 5.0
+  #   step: 0.1
+  #   on_value:
+  #     - component.update: range
+
   - platform: template
     name: "Target Charge"
     id: target_charge
+    # web_server:
+    #   sorting_group_id: sorting_group_control_settings
+    #   sorting_weight: 40
     optimistic: true
     restore_value: true
+    # device_class: battery_charging
     unit_of_measurement: "%"
     min_value: 20
     initial_value: 80
     max_value: 100
     step: 1.0
     on_value:
+      # - script.execute: set_target
       - script.execute: ev_set_charge_limit
       - script.execute: set_charge_current
 
 datetime:
+  # - platform: template
+  #   id: datetime_target
+  #   type: time
+  #   name: Time to Target
+  #   restore_value: True
+  #   optimistic: yes
+
   - platform: template
     id: datetime_ready
     type: time
@@ -179,6 +227,15 @@ binary_sensor:
       then:
       - component.update: charger_current
       - component.update: charger_voltage
+    on_press:
+      then:
+        - globals.set:
+            id: start_energy
+            value: !lambda |-
+              return id(remaining_energy).state;
+    on_release:
+      then:
+        - sensor.integration.reset:  charger_energy
 
   - platform: template
     name: "Charging Socket"
@@ -189,8 +246,13 @@ binary_sensor:
   - platform: template
     name: "Car Present"
     id: car_present
+    # lambda: |-
+    #   return id(hv_battery_charging).state > 0.0f;
     device_class: presence
 
+  - platform: template
+    name: "EVSE Override"
+    id: evse_override
 # 42.46kwh	57.63	15.17
 # 60%		80%	20%
 # 10:20		1:28	15:08
@@ -228,6 +290,7 @@ time:
       - seconds: 0
         minutes: '*'
         then:
+        # - script.execute: set_target
         - script.execute: set_charge_current
           
 script:
@@ -236,11 +299,11 @@ script:
       - sensor.template.publish:
           id: target_charge_current
           state: !lambda |-
-              float full_capacity_energy, remaining_energy_float, target_charge_float, current_charge_float, time_now_float, time_ready_float, time_to_ready_float, needed_energy_float, charger_voltage_float;
+              float full_capacity_energy, remaining_energy_float, target_charge_float, current_charge_float, time_now_float, time_ready_float, time_to_ready_float, needed_energy_float, charger_voltage_float, charger_current_float;
               full_capacity_energy = 73.7f;
               
               target_charge_float = id(target_charge).state;
-              current_charge_float = id(hv_SOC).state;
+              current_charge_float = (id(hv_SOC).state - 0.5f);
               
               remaining_energy_float = id(remaining_energy).state;
 
@@ -269,87 +332,195 @@ script:
               // ESP_LOGI("main", "charger_voltage_float: %02f", charger_voltage_float);
 
               // ESP_LOGI("main", "target_charge_current: %02f", needed_energy_float / ( charger_voltage_float * time_to_ready_float));
-              // 0.95 for charger losses causing current spike at end of charge
-              if( current_charge_float < target_charge_float )
-                return 1000.0f * (needed_energy_float / (charger_voltage_float * time_to_ready_float * 0.95)) + 0.5f; // 0.5 to account for difference between pilot and actual current.
+              // 0.88 derating for charger losses causing current spike at end of charge
+              if( current_charge_float < target_charge_float ) {
+                charger_current_float = 1000.0f * (needed_energy_float / (charger_voltage_float * time_to_ready_float * 0.88)) + 0.5f; // 0.5 to account for difference between pilot and actual current.
+                return min(charger_current_float, 32.0f);
+                }
               else
                 return 0.0f;
       - script.execute: ev_set_state
       - script.execute: ev_set_charge_current
+      # - script.execute:
+      #       id:  openevse_get
+      #       endpoint: 'status'
+      #       key: 'max_current'
 
   - id: ev_send_batt
     then:
-    - http_request.post:
-        url: http://10.0.1.81/status
-        json:
-          battery_level: !lambda |-
-            // charge 1% past target
-            int N = id(hv_SOC).state - 1;
-            char str[12];
-            return itoa(N, str, 10) ;
+    - if:
+        condition:
+          - switch.is_on: evse_api
+        then:
+          - http_request.post:
+              url: http://10.0.1.229/status
+              json:
+                battery_level: !lambda |-
+                  // charge 1% past target
+                  int N = id(hv_SOC).state - 0.5f;
+                  char str[12];
+                  return itoa(N, str, 10) ;
+                # battery_range: '0'
+                # time_to_full_charge: '0'
+
+      # - script.execute:
+      #     id: openevse_get
+      #     openevse_ip: ${openevse_ip}
+      #     endpoint: 'status'
+      #     # key: 'manual_override'
+
+
+  - id: openevse_get
+    parameters:
+      openevse_ip: string
+      endpoint: string
+      # key: string
+    then:
+# https://community.home-assistant.io/t/http-request-get-does-not-work-need-one-variable-from-webpage/952854/11
+    - http_request.get:
+        url: !lambda |-
+          // ESP_LOGD("http_parse", std::string("http://" + openevse_ip + "/" + endpoint).c_str());
+          // return std::string("http://" + openevse_ip + "/" + endpoint).c_str(); // "http://" + openevse_ip + "/" + endpoint;
+          return "http://" + openevse_ip + "/" + endpoint.c_str();
+        capture_response: true
+        max_response_buffer_size: 8000
+        request_headers:
+          Content-Type: application/json
+        on_response:
+          then:
+            # - if:
+            #     condition:
+            #         lambda: return response->status_code == 200;
+            #     then:
+                   - lambda: |-
+                       json::parse_json(body, [](JsonObject root)  {
+                       if(root["manual_override"] == 1) {
+                         id(evse_override).publish_state(true);
+                         ESP_LOGI("main","override is on");
+                       }
+                        else {
+                         id(evse_override).publish_state(false);
+                         ESP_LOGI("main","override is off");
+                        }
+                        
+                       // float value = atof(counterstring) * 1.0f ;
+                       // id(return_data_2).publish_state(value);
+                       return true;
+                       });
+            
           
 # url: http://10.0.1.81/limit
   # type: 'soc'
   # auto_release: 'true'
   - id: ev_set_charge_limit
     then:
-    - http_request.post:
-        url: http://10.0.1.81/config
-        json:
-          limit_default_value: !lambda |-
-            int N = id(target_charge).state;
-            char str[12];
-            return itoa(N, str, 10) ;
-          limit_default_type: 'soc'
+    - if:
+        condition:
+          - switch.is_on: evse_api
+        then:
+          - http_request.post:
+              url: http://10.0.1.229/config
+              json:
+                limit_default_value: !lambda |-
+                  int N = id(target_charge).state;
+                  char str[12];
+                  return itoa(N, str, 10) ;
+                limit_default_type: 'soc'
 
   - id: ev_set_state
     then:
-      - if:
-          condition: 
-            lambda: |-
-              float target_charge_current_float = id(target_charge_current).state;
-              int target_charge_current_int = ceil(target_charge_current_float);
-              int safe_current_int;
-              return target_charge_current_int < 6;
-
-          then:
-            - http_request.post:
-                url: http://10.0.1.81/override
-                json:
-                  state: 'disabled'
-          else:
-            - http_request.send:
-                method: DELETE
-                url: http://10.0.1.81/override
+    - if:
+        condition:
+          - switch.is_on: evse_api
+        then:
+          - if:
+              condition: 
+                - lambda: |-
+                    float target_charge_current_float = id(target_charge_current).state;
+                    int target_charge_current_int = ceil(target_charge_current_float);
+                    int safe_current_int;
+                    return target_charge_current_int < 6;
+              then:
+                if:
+                  condition:
+                  - binary_sensor.is_off: evse_override
+                  then:
+                  - http_request.post:
+                      url: http://10.0.1.229/override
+                      json:
+                        state: 'disabled'
+                      capture_response: true
+                      on_response:
+                        then:
+                          - if:
+                              condition:
+                                  lambda: return response->status_code == 201;
+                              then:
+                                  - binary_sensor.template.publish:
+                                      id: evse_override
+                                      state: ON
+              else:
+                if:
+                  condition:
+                  - binary_sensor.is_on: evse_override
+                  then:
+                  - http_request.send:
+                      method: DELETE
+                      url: http://10.0.1.229/override
+                      capture_response: true
+                      on_response:
+                        then:
+                          - if:
+                              condition:
+                                  lambda: return response->status_code == 200;
+                              then:
+                                  - binary_sensor.template.publish:
+                                      id: evse_override
+                                      state: OFF
 
   - id: ev_set_charge_current
     then:
-    - http_request.post:
-        url: http://10.0.1.81/config
-        json:
-          max_current_soft: !lambda |-
-            float target_charge_current_float = id(target_charge_current).state;
-            int target_charge_current_int = ceil(target_charge_current_float);
-            int safe_current_int;
-            
-            if( target_charge_current_int < 6)
-              safe_current_int = 6;
-            else if( target_charge_current_int > 32 )
-              safe_current_int = 32;
-            else
-              safe_current_int = target_charge_current_int;
-            
-            char str[12];
-            return itoa(safe_current_int, str, 10);
+    - if:
+        condition:
+          - switch.is_on: evse_api
+        then:
+          - http_request.post:
+              url: http://10.0.1.229/config
+              json:
+                max_current_soft: !lambda |-
+                  float target_charge_current_float = id(target_charge_current).state;
+                  int target_charge_current_int = ceil(target_charge_current_float);
+                  int safe_current_int;
+                  
+                  if( target_charge_current_int < 6)
+                    safe_current_int = 6;
+                  else if( target_charge_current_int > 32 )
+                    safe_current_int = 32;
+                  else
+                    safe_current_int = target_charge_current_int;
+                  
+                  char str[12];
+                  return itoa(safe_current_int, str, 10);
     
 sensor:
+  - platform: integration
+    name: 'Charger Energy'
+    id: charger_energy
+    sensor: charger_power
+    time_unit: h
+    restore: true
+    state_class: total_increasing
+    device_class: energy
+    filters:
+    - round: 2
+    
   - platform: template
     name: "Target Charge Current"
     id: target_charge_current
     device_class: current
     unit_of_measurement: A
     filters:
-    - round: 1
+    - round: 2
 
   # 0:62B002D00000
   # 1:00FF9B00000000
@@ -368,6 +539,7 @@ sensor:
 
     # when charging [9] = 0111 0010
   - platform: ble_elm327
+    # name: "HV Battery Charging - raw"
     id: hv_battery_charging
     pid: "0101"
     mode: "22"
@@ -387,9 +559,10 @@ sensor:
     pre_commands:
       - "ATSH 744"
     update_interval: 60s
-    formula: "return x[4];"
+    formula: "return x[4];" # & 0x01;" # BIT POSITION 38, 1's place
     
     # new capacity is 77.4kWh
+    # this may be calculated from 70kWh
     # https://www.reddit.com/r/Ioniq5/comments/1uy5k56/comment/oxwil5x/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
   - platform: ble_elm327
     name: "Remaining Energy"
@@ -409,7 +582,9 @@ sensor:
           min_value: 2.0
           ignore_out_of_range: true
     on_value:
+      # - script.execute: set_target
       - script.execute: set_charge_current
+      # - component.update: range
       
   - platform: ble_elm327
     name: "HV Battery State of Charge"
@@ -419,6 +594,7 @@ sensor:
     pre_commands:
       - "ATSH 7E4"
     update_interval: 60s
+    # formula: "return x[4] / 2.0f;"
     formula: "return x[31] / 2.0f;"
     device_class: battery
     unit_of_measurement: "%"
@@ -466,6 +642,7 @@ sensor:
 
 
   - platform: ble_elm327
+    # name: "Charger Voltage - raw"
     id: "charger_voltage_raw"
     pid: "E002"
     mode: "22"
@@ -481,6 +658,7 @@ sensor:
       - component.update: charger_voltage
 
   - platform: ble_elm327
+    # name: "Charger Current - raw"
     id: "charger_current_raw"
     pid: "E002"
     mode: "22"
@@ -513,7 +691,17 @@ sensor:
     on_value:
       - component.update: charger_power
 
-- platform: template
+  # - platform: template
+  #   name: "Vehicle Range"
+  #   id: range
+  #   # subtract 10% range for nice coushin
+  #   lambda: |-
+  #     return (id(remaining_energy).state - 7) * id(efficiency).state;
+  #   device_class: distance
+  #   unit_of_measurement: mi
+  #   accuracy_decimals: 0
+
+  - platform: template
     name: "Charger Current"
     id: "charger_current"
     lambda: |-
@@ -535,6 +723,8 @@ sensor:
     device_class: power
     unit_of_measurement: kW
     accuracy_decimals: 2
+    # on_value:
+    #   - script.execute: set_target
 
   - platform: ble_elm327
     name: "12V Battery State of Charge"
@@ -582,5 +772,67 @@ sensor:
     accuracy_decimals: 2
     filters:
       - clamp:
-          max_value: 20.0
+          max_value: 120.0
+          min_value: -120.0
           ignore_out_of_range: true
+          
+  # - platform: ble_elm327
+  #   name: "HV Battery Current"
+  #   pid: "E003"
+  #   mode: "22"
+  #   pre_commands:
+  #     - "ATSH 744"
+  #   update_interval: 60s
+  #   formula: "return (x[22] * 256.0f + x[23]) / 10.0f;"
+  #   device_class: current
+  #   unit_of_measurement: A
+  #   accuracy_decimals: 2
+  #   # filters:
+  #   #   - clamp:
+  #   #       max_value: 20.0
+  #   #       ignore_out_of_range: true
+              
+  # - platform: ble_elm327
+  #   name: "HV Battery Voltage"
+  #   pid: "E003"
+  #   mode: "22"
+  #   pre_commands:
+  #     - "ATSH 744"
+  #   update_interval: 60s
+  #   formula: "return (x[20] * 256.0f + x[21]) / 10.0f;"
+  #   device_class: voltage
+  #   unit_of_measurement: V
+  #   accuracy_decimals: 1
+
+    # - id: set_target
+  #   mode: queued
+  #   then:
+  #     - datetime.time.set:
+  #         id: datetime_target
+  #         time: !lambda |-
+  #           float remaining_energy_int, target_charge_int, energy_diff, charge_power, target_energy, target_time, total_time;
+  #           // get current charge
+  #           remaining_energy_int = id(remaining_energy).state;
+  #           // get target charge
+  #           target_charge_int = id(target_charge).state;
+  #           // full capacty is 77.4kWh
+  #           // 72.075f; (using 80% value extrapolated to full capacity) # 57.66kWh = 80%
+  #           target_energy = ( target_charge_int / 100.0f ) * 72.075f;
+  #           // target_energy = ( target_charge_int / 100.0f ) * 70.0f;
+  #           // get difference
+  #           energy_diff = target_energy - remaining_energy_int; // original estimate from car was 5:50, or 2:30am 7/25/2026 from 51.87kWh
+  #           // ESP_LOGI("main", "energy_diff: %02f", energy_diff);
+            
+  #           charge_power = id(charger_power).state * 0.95; // 75.7% was perfect for the 120/2A charger. charge efficiency, dependant on charger power
+            
+  #           target_time = max(energy_diff / charge_power, 0.0f);
+  #           // ESP_LOGI("main", "target_time: %02f", target_time);
+
+  #           total_time = target_time + id(my_time).now().hour + (id(my_time).now().minute / 60.0f);
+            
+  #           int this_minute, this_hour;
+  #           this_minute = (int)(((int)(total_time * 60)) % 60);
+            
+  #           this_hour = ((int)total_time) % 24;            
+
+  #           return {.minute = (uint8_t) this_minute, .hour = (uint8_t) this_hour};
